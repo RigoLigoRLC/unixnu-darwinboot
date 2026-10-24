@@ -111,7 +111,7 @@ Done:
 
 STATIC
 EFI_STATUS
-ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+ParseKernel (CONST UINT8 *Data, UINTN Size, UINT64 WindowSize, KERNEL *Kernel)
 {
   UINTN    Offset;
   UINTN    End;
@@ -149,7 +149,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
         Segment->FileOffset = U64 (Data + Offset + 40);
         Segment->FileSize = U64 (Data + Offset + 48);
         Segment->Protection = U32 (Data + Offset + 60);
-        if ((Segment->Size > WINDOW_SIZE) || (Segment->Address > MAX_UINT64 - Segment->Size) ||
+        if ((Segment->Size > WindowSize) || (Segment->Address > MAX_UINT64 - Segment->Size) ||
             (Segment->FileSize > Segment->Size) || (Segment->FileOffset > Size) ||
             (Segment->FileSize > Size - Segment->FileOffset)) { return EFI_LOAD_ERROR; }
       }
@@ -176,8 +176,8 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
     }
   }
   if (!Executable || (Kernel->Entry & 3) || (Kernel->Base & EFI_PAGE_MASK) ||
-      (Kernel->Base > MAX_UINT64 - WINDOW_SIZE) ||
-      (Kernel->End - Kernel->Base > WINDOW_SIZE - SIZE_2MB)) { return EFI_LOAD_ERROR; }
+      (Kernel->Base > MAX_UINT64 - WindowSize) ||
+      (Kernel->End - Kernel->Base > WindowSize - SIZE_2MB)) { return EFI_LOAD_ERROR; }
   return EFI_SUCCESS;
 }
 
@@ -453,6 +453,37 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
 }
 
 STATIC
+BOOLEAN
+HasBootArgument (CONST CHAR8 *CommandLine, CONST CHAR8 *Wanted)
+{
+  CONST CHAR8 *Argument;
+  CONST CHAR8 *End;
+  UINTN       WantedLength;
+
+  Argument = CommandLine;
+  WantedLength = AsciiStrLen (Wanted);
+  while (*Argument != '\0') {
+    while ((*Argument == ' ') || (*Argument == '\t')) {
+      Argument++;
+    }
+
+    End = Argument;
+    while ((*End != '\0') && (*End != ' ') && (*End != '\t')) {
+      End++;
+    }
+
+    if (((UINTN)(End - Argument) == WantedLength) &&
+        (AsciiStrnCmp (Argument, Wanted, WantedLength) == 0)) {
+      return TRUE;
+    }
+
+    Argument = End;
+  }
+
+  return FALSE;
+}
+
+STATIC
 EFI_STATUS
 EFIAPI
 Boot (
@@ -487,6 +518,7 @@ Boot (
   UINTN                           RamdiskExpandedSize;
   BOOLEAN                         RamdiskPacked;
   BOOLEAN                         KeepPacked;
+  BOOLEAN                         HandoffDiagnostics;
   UINTN                           TrustCacheOffset;
   UINT64                          TrustCacheAddress;
   UINTN                           AddonOffset;
@@ -537,9 +569,7 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
-  Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
-  if (EFI_ERROR (Status)) { goto Fail; }
-  Status = ParseKernel (Image, ImageSize, &Kernel);
+  Status = ReadFile (Root, Request->KernelPath, SIZE_512MB, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
@@ -557,6 +587,10 @@ Boot (
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
+  Status = ParseKernel (Image, ImageSize, WindowSize, &Kernel);
+  if (EFI_ERROR (Status)) {
+    goto Fail;
+  }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
   if (Request->Ramdisk != NULL) {
     if ((RamdiskOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + RamdiskOffset) != 0) ||
@@ -599,6 +633,11 @@ Boot (
   }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
+  HandoffDiagnostics = HasBootArgument (CommandLine, "darwinboot-handoff-diagnostics=1");
+  if (HasBootArgument (CommandLine, "-v")) {
+    Video[1] = 0;
+  }
+
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
@@ -661,26 +700,10 @@ Boot (
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
-  //
-  // The same facts in large type over the whole screen. The firmware's log
-  // draws far larger than the text console, and the form feed clears the
-  // screen first. This is what stays visible if the kernel never draws.
-  //
-  DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
-  DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
-  DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
-  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
-  DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
-  DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12))));
-  DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1)));
-  DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
-          READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
-  DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
-  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
+  if (HandoffDiagnostics) {
+    DEBUG ((DEBUG_ERROR, "DARWINBOOT: handoff diagnostics enabled; CurrentEL %lu SCTLR_EL1 0x%lx TCR_EL1 0x%lx\n",
+            DarwinCurrentEl () >> 2, READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1)));
+  }
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
@@ -690,7 +713,8 @@ Boot (
     }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize,
+                   HandoffDiagnostics ? Video[0] : 0, HandoffDiagnostics ? Video[2] * Video[4] : 0);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }

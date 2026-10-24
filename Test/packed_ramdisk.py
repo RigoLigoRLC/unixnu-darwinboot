@@ -2,6 +2,7 @@
 """Lossless zero-page packing for the DarwinBoot DBRDISK1 input format."""
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import struct
 
@@ -71,13 +72,14 @@ def inspect(path):
     if not 0 < size <= MAX_INPUT:
         raise ValueError('Encoded RAM disk exceeds 256 MiB input bound')
     blob = path.read_bytes()
-    encoded_hash = hashlib.sha256(blob).hexdigest()
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
+    encoded_hash = hashlib.sha256(blob).hexdigest() if record_hashes else None
     if blob[:8] == b'DBRDISK1':
         logical, extents = regions(blob)
         header = bytes(PAGE)
         if extents and extents[0][0] == 0:
             header = bytes(extents[0][1][:PAGE])
-        return dict(bytes=logical, sha256=logical_hash(logical, extents),
+        return dict(bytes=logical, sha256=logical_hash(logical, extents) if record_hashes else None,
                     encoded_bytes=size, encoded_sha256=encoded_hash, packed=True), header
     if size % PAGE:
         raise ValueError('Raw RAM disk must be page aligned')
@@ -104,7 +106,8 @@ def pack(source, destination):
     if not 0 < logical <= MAX_LOGICAL or logical % PAGE:
         raise ValueError('Raw input must be page aligned and at most 1 TiB')
     extents = []
-    digest = hashlib.sha256()
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
+    digest = hashlib.sha256() if record_hashes else None
     total = 32
     large = logical > PLAIN_HASH_LIMIT
     with source.open('rb') as stream:
@@ -124,7 +127,7 @@ def pack(source, destination):
             chunk = stream.read(min(len(ZERO), logical - base))
             if len(chunk) != min(len(ZERO), logical - base):
                 raise ValueError('Raw input changed during packing')
-            if not large:
+            if not large and record_hashes:
                 digest.update(chunk)
             for at in range(0, len(chunk), PAGE):
                 page = chunk[at:at + PAGE]
@@ -146,7 +149,7 @@ def pack(source, destination):
         for _, data in extents:
             output.write(data)
     metadata, _ = inspect(destination)
-    if not large and metadata['sha256'] != digest.hexdigest():
+    if not large and record_hashes and metadata['sha256'] != digest.hexdigest():
         raise ValueError('Packed reconstruction differs from complete raw input hash')
     return metadata
 

@@ -9,11 +9,14 @@ ASM_FUNC(DarwinCurrentEl)
 // PA (0 for none), x5=its size in bytes. EL1 only.
 ASM_FUNC(DarwinEnter)
   msr daifset, #15
-  // Breadcrumb: a green bar (BGRA 0xFF00FF00) over the top 1/16 of the frame
-  // buffer shows that this code ran, whatever the kernel does afterwards.
+  mov x12, x4
+  lsr x13, x5, #4
+  bic x13, x13, #7
+
+  // The first green band records entry after ExitBootServices succeeded.
   cbz x4, 2f
-  lsr x9, x5, #4
-  bic x9, x9, #7
+  cbz x13, 2f
+  mov x9, x13
   mov w10, #0xFF00
   movk w10, #0xFF00, lsl #16
   mov x11, x4
@@ -40,6 +43,20 @@ ASM_FUNC(DarwinEnter)
   ic iallu
   dsb sy
   isb
+
+  // The second cyan band records completion of the kernel-window cache work.
+  cbz x12, 5f
+  cbz x13, 5f
+  mov x9, x13
+  mov w10, #0xFFFF
+  movk w10, #0xFF00, lsl #16
+  add x11, x12, x13
+4:
+  stp w10, w10, [x11], #8
+  subs x9, x9, #8
+  b.hi 4b
+  dsb sy
+5:
   mrs x4, sctlr_el1
   bic x4, x4, #1
   bic x4, x4, #4
@@ -49,4 +66,18 @@ ASM_FUNC(DarwinEnter)
   tlbi vmalle1
   dsb sy
   isb
+
+  // The third blue band records execution with EL1 MMU and caches disabled.
+  cbz x12, 7f
+  cbz x13, 7f
+  mov x9, x13
+  mov w10, #0x00FF
+  movk w10, #0xFF00, lsl #16
+  add x11, x12, x13, lsl #1
+6:
+  stp w10, w10, [x11], #8
+  subs x9, x9, #8
+  b.hi 6b
+  dsb sy
+7:
   br x1
