@@ -183,7 +183,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, UINT64 WindowSize, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, UINT64 *MinimumWindowSize, BOOLEAN *KeepPacked)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -194,6 +194,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  TrustCandidate;
   UINTN  AddonCandidate;
   UINTN  MemoryCandidate;
+  UINTN  MemoryRangeCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -203,6 +204,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   TrustCandidate = MAX_UINTN;
   AddonCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
+  MemoryRangeCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -240,6 +242,13 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-range") == 0) {
+      if ((MemoryRangeCandidate != MAX_UINTN) || (Length != 16)) {
+        return FALSE;
+      }
+
+      MemoryRangeCandidate = *Offset;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -264,10 +273,23 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
     *WindowSize = U64 (Data + MemoryCandidate);
     if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
+    *MinimumWindowSize = *WindowSize;
+  }
+  if (MemoryRangeCandidate != MAX_UINTN) {
+    if ((Path != 1) || (*WindowSize != 0)) {
+      return FALSE;
+    }
+
+    *MinimumWindowSize = U64 (Data + MemoryRangeCandidate);
+    *WindowSize = U64 (Data + MemoryRangeCandidate + 8);
+    if (!DarwinWindowSizeValid (*MinimumWindowSize) ||
+        !DarwinWindowSizeValid (*WindowSize) || (*MinimumWindowSize > *WindowSize)) {
+      return FALSE;
+    }
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, MinimumWindowSize, KeepPacked)) { return FALSE; }
   }
   return TRUE;
 }
@@ -336,7 +358,8 @@ RunEnd (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT
     Extended = FALSE;
     for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
       Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
-      if ((Descriptor->Type == EfiConventionalMemory) && (Descriptor->PhysicalStart == End) &&
+      if ((Descriptor->Type == EfiConventionalMemory) && ((Descriptor->Attribute & EFI_MEMORY_RUNTIME) == 0) &&
+          (Descriptor->PhysicalStart == End) &&
           (Descriptor->NumberOfPages != 0) && (Descriptor->NumberOfPages < (MAX_UINT64 - End) / EFI_PAGE_SIZE)) {
         End += EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
         Extended = TRUE;
@@ -398,7 +421,7 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
 
 STATIC
 EFI_STATUS
-AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
+AllocateWindow (KERNEL *Kernel, UINT64 MinimumWindowSize, UINT64 *WindowSize, EFI_PHYSICAL_ADDRESS *Address)
 {
   EFI_MEMORY_DESCRIPTOR *Map;
   EFI_MEMORY_DESCRIPTOR *Descriptor;
@@ -413,31 +436,68 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   UINT64                BestStart;
   UINT64                BestBytes;
   UINT64                RunBytes;
+  UINTN                 BestOffset;
+  UINT64                MaximumWindowSize;
 
   *Address = 0;
   Map = NULL;
   Capacity = 0;
   BestStart = 0;
   BestBytes = 0;
+  MaximumWindowSize = *WindowSize;
   Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
   if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
   Status = EFI_OUT_OF_RESOURCES;
-  for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
-    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
-    if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
-    End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
-                  Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
-    RunBytes = End - Descriptor->PhysicalStart;
-    if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
-    Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
-    if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
-    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
-    if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+  // The window contains only conventional pages acquired from boot services.
+  // Adjacent free descriptors may form one allocation; reserved pages end a run.
+  // The largest run is tried first, with its actual size passed to XNU.
+  for (;;) {
+    BestOffset = MAX_UINTN;
+    BestBytes = 0;
+    for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
+      Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+      if ((Descriptor->Type != EfiConventionalMemory) || ((Descriptor->Attribute & EFI_MEMORY_RUNTIME) != 0) ||
+          (Descriptor->NumberOfPages == 0) ||
+          (Descriptor->NumberOfPages > (MAX_UINT64 - Descriptor->PhysicalStart) / EFI_PAGE_SIZE)) {
+        continue;
+      }
+
+      End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
+                    Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+      Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
+      if ((Candidate < Descriptor->PhysicalStart) || (Candidate >= End)) {
+        continue;
+      }
+
+      RunBytes = MIN (End - Candidate, MaximumWindowSize) & ~((UINT64)BLOCK_SIZE - 1);
+      if ((RunBytes >= MinimumWindowSize) && (RunBytes > BestBytes)) {
+        BestOffset = Offset;
+        BestStart = Candidate;
+        BestBytes = RunBytes;
+      }
+    }
+
+    if (BestOffset == MAX_UINTN) {
+      break;
+    }
+
+    Candidate = BestStart;
+    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (BestBytes), &Candidate);
+    if (!EFI_ERROR (Status)) {
+      *Address = Candidate;
+      *WindowSize = BestBytes;
+      Print (L"DARWINBOOT: allocated conventional memory 0x%lx..0x%lx (%lu MiB)\n",
+             Candidate, Candidate + BestBytes, BestBytes / SIZE_1MB);
+      break;
+    }
+
+    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + BestOffset);
+    Descriptor->Type = EfiReservedMemoryType;
   }
   if (EFI_ERROR (Status)) {
     CHAR16 Line[96];
     UINTN  Row = 1;
-    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx BIG RUN %lx @ %lx", WindowSize, BestBytes, BestStart);
+    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx..%lx", MinimumWindowSize, MaximumWindowSize);
     DiagDraw (Line, 0);
     for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
       Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
@@ -512,6 +572,7 @@ Boot (
   UINT64                          TreeAddress;
   UINT64                          Used;
   UINT64                          WindowSize;
+  UINT64                          MinimumWindowSize;
   UINT64                          RamdiskAddress;
   UINTN                           RamdiskOffset;
   UINTN                           RamdiskBytes;
@@ -583,10 +644,14 @@ Boot (
   TrustCacheOffset = MAX_UINTN;
   AddonOffset = MAX_UINTN;
   WindowSize = 0;
+  MinimumWindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &MinimumWindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
-  if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
+  if (WindowSize == 0) {
+    WindowSize = WINDOW_SIZE;
+    MinimumWindowSize = WINDOW_SIZE;
+  }
   Status = ParseKernel (Image, ImageSize, WindowSize, &Kernel);
   if (EFI_ERROR (Status)) {
     goto Fail;
@@ -638,7 +703,7 @@ Boot (
     Video[1] = 0;
   }
 
-  Status = AllocateWindow (&Kernel, WindowSize, &Address);
+  Status = AllocateWindow (&Kernel, MinimumWindowSize, &WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
